@@ -1,101 +1,30 @@
-import math
-import pulp
-
-def assign_with_greedy_and_lp(prob, x, df, num_csms, max_accounts_per_csm=83, min_size_for_greedy=40):
-    """
-    Two-phase assignment:
-    - Phase 1: Greedy preassignment for large families (fix variables).
-    - Phase 2: LP solver for remaining accounts and constraints.
-    """
-    print("Starting greedy preassignment for large families...")
-
-    assigned = set()
-    parent_ids = df['parent_account_id'].dropna().unique()
-    family_id_counter = 0
-
-    for parent_id in parent_ids:
-        family_indices = df.index[df['parent_account_id'] == parent_id].tolist()
-        family_size = len(family_indices)
-
-        if family_size < min_size_for_greedy:
-            continue  # Leave small families to LP
-
-        csms_needed = math.ceil(family_size / max_accounts_per_csm)
-
-        # Assign in round-robin to avoid CSM overload
-        for i in range(csms_needed):
-            csm = (family_id_counter + i) % num_csms
-            accounts_for_csm = family_indices[i::csms_needed]
-            for acc_idx in accounts_for_csm:
-                prob += x[acc_idx, csm] == 1, f"greedy_fix_{acc_idx}_{csm}"
-                assigned.add((acc_idx, csm))
-
-        family_id_counter += 1
-
-    print(f"Greedy preassignment completed for {family_id_counter} large families.")
-    print("Proceeding with LP optimization for the rest...")
-
-    return prob
-
-
-
-from collections import defaultdict
-
-def greedy_assignment(df, num_csms, max_accounts_per_csm=83):
-    assignments = defaultdict(list)
-    csm_load = [0] * num_csms
-    csm_index = 0
-
-    for parent_id in df['parent_account_id'].dropna().unique():
-        family_indices = df.index[df['parent_account_id'] == parent_id].tolist()
-        family_size = len(family_indices)
-
-        csms_needed = math.ceil(family_size / max_accounts_per_csm)
-        selected_csms = []
-
-        for _ in range(csms_needed):
-            while csm_load[csm_index] + (family_size // csms_needed) > max_accounts_per_csm:
-                csm_index = (csm_index + 1) % num_csms
-            selected_csms.append(csm_index)
-            csm_index = (csm_index + 1) % num_csms
-
-        for idx, acc in enumerate(family_indices):
-            assigned_csm = selected_csms[idx % csms_needed]
-            assignments[assigned_csm].append(acc)
-            csm_load[assigned_csm] += 1
-
-    return assignments
-
-
-
-
 import pandas as pd
 from collections import defaultdict
 
-def normalize_pods_in_df(optimized_df, num_csms, max_accounts_per_csm=83):
+def normalize_pods_in_df(optimized_df, new_csm_column, max_accounts_per_csm=83):
     """
     Normalize optimized_df to group accounts from the same parent_account_id
-    under the same CSM if possible, respecting per-CSM capacity.
+    under the same CSM (from new_csm_column) if possible.
 
     Parameters:
-    - optimized_df: DataFrame with 'account_id', 'parent_account_id', and 'assigned_csm'
-    - num_csms: total number of available CSMs
-    - max_accounts_per_csm: max accounts a CSM can handle
+    - optimized_df: DataFrame with 'account_id', 'parent_account_id', and CSM name column
+    - new_csm_column: column name containing actual CSM names
+    - max_accounts_per_csm: maximum accounts a CSM can handle
 
     Returns:
-    - updated_df: DataFrame with normalized 'assigned_csm'
+    - updated_df: DataFrame with normalized assignments in the same CSM name column
     """
     df = optimized_df.copy()
 
-    # Map of CSM to list of assigned accounts
+    # Build mappings
     csm_to_accounts = defaultdict(list)
-    account_to_csm = dict(zip(df.index, df['assigned_csm']))
+    account_to_csm = dict(zip(df.index, df[new_csm_column]))
 
-    # Populate initial state
     for idx, row in df.iterrows():
-        csm_to_accounts[row['assigned_csm']].append(idx)
+        csm = row[new_csm_column]
+        csm_to_accounts[csm].append(idx)
 
-    # Group accounts by family
+    # Group accounts by parent account (families)
     family_groups = df.groupby('parent_account_id').groups
 
     for parent_id, account_indices in family_groups.items():
@@ -103,17 +32,16 @@ def normalize_pods_in_df(optimized_df, num_csms, max_accounts_per_csm=83):
         if len(account_indices) <= 1:
             continue
 
-        # Count how many accounts from this family are assigned to each CSM
+        # Count how many accounts from this family are already assigned to each CSM
         csm_counts = defaultdict(int)
         for idx in account_indices:
-            csm = df.loc[idx, 'assigned_csm']
+            csm = df.loc[idx, new_csm_column]
             csm_counts[csm] += 1
 
-        # Prefer CSMs with most of this family's accounts
+        # Preferred order: keep existing CSMs with most family members
         preferred_csms = sorted(csm_counts.items(), key=lambda x: -x[1])
-        fallback_csms = [j for j in range(num_csms) if j not in csm_counts]
-
-        candidate_csms = [j for j, _ in preferred_csms] + fallback_csms
+        fallback_csms = [csm for csm in csm_to_accounts if csm not in csm_counts]
+        candidate_csms = [csm for csm, _ in preferred_csms] + fallback_csms
 
         reassigned = set()
 
@@ -122,28 +50,26 @@ def normalize_pods_in_df(optimized_df, num_csms, max_accounts_per_csm=83):
                 continue
 
             for csm in candidate_csms:
-                # Remove non-family accounts from this CSM if needed
+                # Remove non-family accounts to make room
                 current_accounts = csm_to_accounts[csm]
                 to_remove = [i for i in current_accounts if df.loc[i, 'parent_account_id'] != parent_id]
 
-                # Clean up space
                 for i in to_remove:
                     csm_to_accounts[csm].remove(i)
-                    df.at[i, 'assigned_csm'] = -1  # unassign temporarily
+                    df.at[i, new_csm_column] = None  # mark for reassignment
 
                 if len(csm_to_accounts[csm]) < max_accounts_per_csm:
                     csm_to_accounts[csm].append(idx)
-                    df.at[idx, 'assigned_csm'] = csm
+                    df.at[idx, new_csm_column] = csm
                     reassigned.add(idx)
-                    break  # Go to next account
+                    break
 
-    # Reassign unassigned ones (fallback)
-    unassigned = df[df['assigned_csm'] == -1]
-    for idx in unassigned.index:
-        for csm in range(num_csms):
+    # Reassign any leftover unassigned accounts
+    for idx in df[df[new_csm_column].isna()].index:
+        for csm in csm_to_accounts:
             if len(csm_to_accounts[csm]) < max_accounts_per_csm:
                 csm_to_accounts[csm].append(idx)
-                df.at[idx, 'assigned_csm'] = csm
+                df.at[idx, new_csm_column] = csm
                 break
 
     return df
