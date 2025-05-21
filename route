@@ -1,0 +1,54 @@
+import math
+
+def _add_pod_constraints(prob, x, df, num_csms, max_accounts_per_csm=83):
+    print('Adding intelligent POD constraints: Prefer single CSM, split only if needed based on per-CSM capacity.')
+
+    parent_ids = df['parent_account_id'].dropna().unique()
+    print(f'Found {len(parent_ids)} unique parent accounts (families)')
+
+    constraint_count = 0
+
+    for parent_id in parent_ids:
+        family_indices = df.index[df['parent_account_id'] == parent_id].tolist()
+        family_size = len(family_indices)
+
+        # Skip single-account families
+        if family_size <= 1:
+            continue
+
+        # Dynamically calculate how many CSMs are *needed* to fit the family under max_accounts_per_csm
+        required_csms = math.ceil(family_size / max_accounts_per_csm)
+
+        # Binary vars to track if CSM j is used for this family
+        y = pulp.LpVariable.dicts(f"csm_used_{parent_id}", list(range(num_csms)), 0, 1, cat="Binary")
+
+        for j in range(num_csms):
+            # If any account in the family is assigned to j, mark y[j] = 1
+            prob += (
+                pulp.lpSum(x[i, j] for i in family_indices) <= family_size * y[j],
+                f"link_csm_to_family_{parent_id}_{j}"
+            )
+
+            # No CSM can get more than `max_accounts_per_csm` accounts from this family
+            prob += (
+                pulp.lpSum(x[i, j] for i in family_indices) <= max_accounts_per_csm,
+                f"per_csm_family_cap_{parent_id}_{j}"
+            )
+
+            # Enforce POD-style consistent assignment
+            for i in family_indices:
+                prob += (
+                    x[i, j] <= y[j],
+                    f"account_csm_pod_consistency_{parent_id}_{i}_{j}"
+                )
+
+        # Final constraint: only the minimum required number of CSMs (1 if possible, 2/3 if necessary)
+        prob += (
+            pulp.lpSum(y[j] for j in range(num_csms)) <= required_csms,
+            f"required_pod_size_{parent_id}"
+        )
+
+        constraint_count += 1 + family_size * num_csms + 2 * num_csms
+
+    print(f'Added approximately {constraint_count} POD constraints.')
+    return prob
