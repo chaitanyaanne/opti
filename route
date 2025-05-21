@@ -36,3 +36,32 @@ def assign_with_greedy_and_lp(prob, x, df, num_csms, max_accounts_per_csm=83, mi
     print("Proceeding with LP optimization for the rest...")
 
     return prob
+
+
+
+from collections import defaultdict
+
+def greedy_assignment(df, num_csms, max_accounts_per_csm=83):
+    assignments = defaultdict(list)
+    csm_load = [0] * num_csms
+    csm_index = 0
+
+    for parent_id in df['parent_account_id'].dropna().unique():
+        family_indices = df.index[df['parent_account_id'] == parent_id].tolist()
+        family_size = len(family_indices)
+
+        csms_needed = math.ceil(family_size / max_accounts_per_csm)
+        selected_csms = []
+
+        for _ in range(csms_needed):
+            while csm_load[csm_index] + (family_size // csms_needed) > max_accounts_per_csm:
+                csm_index = (csm_index + 1) % num_csms
+            selected_csms.append(csm_index)
+            csm_index = (csm_index + 1) % num_csms
+
+        for idx, acc in enumerate(family_indices):
+            assigned_csm = selected_csms[idx % csms_needed]
+            assignments[assigned_csm].append(acc)
+            csm_load[assigned_csm] += 1
+
+    return assignments
