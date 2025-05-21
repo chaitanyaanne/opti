@@ -1,56 +1,38 @@
 import math
 import pulp
 
-def add_pod_constraints(prob, x, df, num_csms, max_accounts_per_csm=83):
+def assign_with_greedy_and_lp(prob, x, df, num_csms, max_accounts_per_csm=83, min_size_for_greedy=40):
     """
-    Add POD constraints to a Pulp problem to assign each family of accounts
-    (grouped by parent_account_id) to the smallest possible number of CSMs,
-    while respecting the maximum per-CSM capacity.
-    
-    Parameters:
-    - prob: Pulp LpProblem object
-    - x: dictionary of pulp.LpVariable[(account_idx, csm_idx)]
-    - df: pandas DataFrame with at least a 'parent_account_id' column
-    - num_csms: total number of CSMs (columns in x)
-    - max_accounts_per_csm: max number of accounts a CSM can handle per family (default=83)
+    Two-phase assignment:
+    - Phase 1: Greedy preassignment for large families (fix variables).
+    - Phase 2: LP solver for remaining accounts and constraints.
     """
+    print("Starting greedy preassignment for large families...")
 
-    print('Adding POD constraints: prefer single CSM per family; split only when needed.')
-
+    assigned = set()
     parent_ids = df['parent_account_id'].dropna().unique()
-    print(f'Found {len(parent_ids)} unique families')
+    family_id_counter = 0
 
     for parent_id in parent_ids:
         family_indices = df.index[df['parent_account_id'] == parent_id].tolist()
         family_size = len(family_indices)
 
-        if family_size <= 1:
-            continue
+        if family_size < min_size_for_greedy:
+            continue  # Leave small families to LP
 
-        # Minimum number of CSMs needed to serve the family
-        required_csms = math.ceil(family_size / max_accounts_per_csm)
+        csms_needed = math.ceil(family_size / max_accounts_per_csm)
 
-        # Binary indicator: y[j] = 1 if CSM j is assigned to this family
-        y = pulp.LpVariable.dicts(f"csm_used_{parent_id}", range(num_csms), 0, 1, cat="Binary")
+        # Assign in round-robin to avoid CSM overload
+        for i in range(csms_needed):
+            csm = (family_id_counter + i) % num_csms
+            accounts_for_csm = family_indices[i::csms_needed]
+            for acc_idx in accounts_for_csm:
+                prob += x[acc_idx, csm] == 1, f"greedy_fix_{acc_idx}_{csm}"
+                assigned.add((acc_idx, csm))
 
-        for j in range(num_csms):
-            # If any account is assigned to j, y[j] = 1
-            prob += (
-                pulp.lpSum(x[i, j] for i in family_indices) <= family_size * y[j],
-                f"link_csm_to_family_{parent_id}_{j}"
-            )
+        family_id_counter += 1
 
-            # Per-CSM per-family cap
-            prob += (
-                pulp.lpSum(x[i, j] for i in family_indices) <= max_accounts_per_csm,
-                f"family_load_cap_{parent_id}_{j}"
-            )
+    print(f"Greedy preassignment completed for {family_id_counter} large families.")
+    print("Proceeding with LP optimization for the rest...")
 
-        # Limit to only as many CSMs as needed
-        prob += (
-            pulp.lpSum(y[j] for j in range(num_csms)) <= required_csms,
-            f"limit_csm_count_{parent_id}"
-        )
-
-    print('POD constraints added.')
     return prob
