@@ -69,81 +69,81 @@ def greedy_assignment(df, num_csms, max_accounts_per_csm=83):
 
 
 
-
-
 import pandas as pd
 from collections import defaultdict
 
-def normalize_pods_after_lp(assignments, df, num_csms, max_accounts_per_csm=83):
+def normalize_pods_in_df(optimized_df, num_csms, max_accounts_per_csm=83):
     """
-    Normalize CSM assignments post-optimization to ensure families (by parent_account_id)
-    are consolidated into as few CSMs as possible, removing conflicting accounts if needed.
+    Normalize optimized_df to group accounts from the same parent_account_id
+    under the same CSM if possible, respecting per-CSM capacity.
 
     Parameters:
-    - assignments: list of (account_idx, csm_idx) from LP output
-    - df: dataframe with 'parent_account_id' and index matching account_idx
-    - num_csms: total number of CSMs
-    - max_accounts_per_csm: maximum accounts a CSM can handle
+    - optimized_df: DataFrame with 'account_id', 'parent_account_id', and 'assigned_csm'
+    - num_csms: total number of available CSMs
+    - max_accounts_per_csm: max accounts a CSM can handle
 
     Returns:
-    - normalized_assignments: list of (account_idx, csm_idx)
+    - updated_df: DataFrame with normalized 'assigned_csm'
     """
+    df = optimized_df.copy()
 
-    # Step 1: Build current state
+    # Map of CSM to list of assigned accounts
     csm_to_accounts = defaultdict(list)
-    account_to_csm = {}
-    for i, j in assignments:
-        csm_to_accounts[j].append(i)
-        account_to_csm[i] = j
+    account_to_csm = dict(zip(df.index, df['assigned_csm']))
 
-    # Step 2: Group accounts by parent account
+    # Populate initial state
+    for idx, row in df.iterrows():
+        csm_to_accounts[row['assigned_csm']].append(idx)
+
+    # Group accounts by family
     family_groups = df.groupby('parent_account_id').groups
 
-    for parent_id, family_indices in family_groups.items():
-        family_indices = list(family_indices)
-        if len(family_indices) <= 1:
+    for parent_id, account_indices in family_groups.items():
+        account_indices = list(account_indices)
+        if len(account_indices) <= 1:
             continue
 
-        # Count how many from this family were assigned to each CSM
-        csm_family_count = defaultdict(int)
-        for i in family_indices:
-            if i in account_to_csm:
-                j = account_to_csm[i]
-                csm_family_count[j] += 1
+        # Count how many accounts from this family are assigned to each CSM
+        csm_counts = defaultdict(int)
+        for idx in account_indices:
+            csm = df.loc[idx, 'assigned_csm']
+            csm_counts[csm] += 1
 
-        # Sort CSMs by how many from this family they already have
-        preferred_csms = sorted(csm_family_count.items(), key=lambda x: -x[1])
-        fallback_csms = [j for j in range(num_csms) if j not in csm_family_count]
+        # Prefer CSMs with most of this family's accounts
+        preferred_csms = sorted(csm_counts.items(), key=lambda x: -x[1])
+        fallback_csms = [j for j in range(num_csms) if j not in csm_counts]
 
-        # Combine preferred and fallback
         candidate_csms = [j for j, _ in preferred_csms] + fallback_csms
 
         reassigned = set()
 
-        for i in family_indices:
-            if i in reassigned:
+        for idx in account_indices:
+            if idx in reassigned:
                 continue
 
-            for j in candidate_csms:
-                # Remove conflicting accounts if needed to make space
-                current_family = set(df.loc[csm_to_accounts[j], 'parent_account_id'])
+            for csm in candidate_csms:
+                # Remove non-family accounts from this CSM if needed
+                current_accounts = csm_to_accounts[csm]
+                to_remove = [i for i in current_accounts if df.loc[i, 'parent_account_id'] != parent_id]
 
-                # If this CSM has accounts from *other* families, remove them
-                for acc in csm_to_accounts[j][:]:  # Copy to avoid mutation while iterating
-                    if df.loc[acc, 'parent_account_id'] != parent_id:
-                        csm_to_accounts[j].remove(acc)
-                        reassigned.discard(acc)
-                        if acc in account_to_csm:
-                            del account_to_csm[acc]
+                # Clean up space
+                for i in to_remove:
+                    csm_to_accounts[csm].remove(i)
+                    df.at[i, 'assigned_csm'] = -1  # unassign temporarily
 
-                if len(csm_to_accounts[j]) < max_accounts_per_csm:
-                    # Assign this account to CSM j
-                    csm_to_accounts[j].append(i)
-                    account_to_csm[i] = j
-                    reassigned.add(i)
-                    break  # Move to next account
+                if len(csm_to_accounts[csm]) < max_accounts_per_csm:
+                    csm_to_accounts[csm].append(idx)
+                    df.at[idx, 'assigned_csm'] = csm
+                    reassigned.add(idx)
+                    break  # Go to next account
 
-    # Final output
-    normalized_assignments = [(i, j) for i, j in account_to_csm.items()]
-    return normalized_assignments
+    # Reassign unassigned ones (fallback)
+    unassigned = df[df['assigned_csm'] == -1]
+    for idx in unassigned.index:
+        for csm in range(num_csms):
+            if len(csm_to_accounts[csm]) < max_accounts_per_csm:
+                csm_to_accounts[csm].append(idx)
+                df.at[idx, 'assigned_csm'] = csm
+                break
 
+    return df
